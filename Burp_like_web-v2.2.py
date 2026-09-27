@@ -4,6 +4,7 @@
 BURP-LIKE WEB v2.2 — JATHNIEL EDITION
 Proxy d'interception HTTP/HTTPS + interface web moderne (single-file).
 Templates HTML/CSS/JS 100 % embarqués.
+Support WSL (écoute 0.0.0.0 + affichage IP réelle).
 """
 
 import os
@@ -18,6 +19,7 @@ import sqlite3
 import threading
 import hashlib
 import urllib.parse
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,6 +54,29 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 PROXY_PORT = 8080
 WEB_PORT = 5000
+
+
+def get_local_ips():
+    """Retourne les IPs locales (utile pour WSL depuis Windows)."""
+    ips = []
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            ips.append(ip)
+        s.close()
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(["hostname", "-I"], text=True, timeout=2)
+        for ip in out.strip().split():
+            if ip not in ips and not ip.startswith("127."):
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips or ["127.0.0.1"]
 
 
 # ==================== DÉCODAGE ====================
@@ -202,7 +227,6 @@ class Database:
             severity TEXT, type TEXT, url TEXT,
             description TEXT, evidence TEXT, timestamp TEXT
         )""")
-        # Index pour performance
         c.execute("CREATE INDEX IF NOT EXISTS idx_req_host ON requests(host)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_req_method ON requests(method)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_req_status ON requests(status)")
@@ -512,7 +536,6 @@ class InterceptAddon:
             if signal_bus.intercept_enabled:
                 event_key = f"{flow.request.pretty_url}_{id(flow)}"
                 event = signal_bus.add_pending(req_data, event_key)
-                # Timeout court pour ne pas bloquer trop longtemps
                 event.wait(timeout=120)
                 mods = signal_bus.consume_modification(event_key)
 
@@ -618,8 +641,9 @@ class ProxyServer(threading.Thread):
                 pass
 
     async def _run_master(self):
+        # 0.0.0.0 = accessible depuis Windows (WSL)
         opts = options.Options(
-            listen_host="127.0.0.1",
+            listen_host="0.0.0.0",
             listen_port=self.port,
         )
         try:
@@ -638,7 +662,7 @@ class ProxyServer(threading.Thread):
 
         self.addon = InterceptAddon()
         self.master.addons.add(self.addon)
-        print(f"[PROXY] Démarré sur 127.0.0.1:{self.port}")
+        print(f"[PROXY] Démarré sur 0.0.0.0:{self.port}")
         self.ready.set()
         await self.master.run()
 
@@ -910,7 +934,7 @@ LAYOUT = """
     <a href="/decoder" class="{{ 'active' if page=='decoder' else '' }}">🔓 <span>Decoder</span></a>
   </nav>
   <div class="footer">
-    Proxy : 127.0.0.1:8080<br>
+    Proxy : 0.0.0.0:8080<br>
     v2.2 — Jathniel
   </div>
 </aside>
@@ -922,8 +946,6 @@ LAYOUT = """
 </body>
 </html>
 """
-
-# ---------- Pages ----------
 
 DASHBOARD_CONTENT = """
 <h1>📊 Dashboard</h1>
@@ -1292,7 +1314,6 @@ $('#btn-send').onclick = async () => {
     <h2>Headers</h2><pre>${JSON.stringify(res.headers,null,2)}</pre>
     <h2>Body</h2><pre>${(res.body||'').slice(0,10000)}</pre>`;
 };
-// Préremplir depuis history
 const params = new URLSearchParams(location.search);
 if (params.get('id')) {
   api('/api/request/' + params.get('id')).then(r => {
@@ -1434,7 +1455,7 @@ def api_request_detail(req_id):
     if not row:
         return jsonify({"error": "not found"}), 404
 
-    # Colonnes : 0id 1method 2url 3host 4path 5headers 6body 7status
+    # 0id 1method 2url 3host 4path 5headers 6body 7status
     # 8resp_headers 9resp_body 10timestamp 11modified 12resp_size
     # 13ct_req 14ct_resp 15decoded_body
     try:
@@ -1717,7 +1738,6 @@ def run_intruder(config):
     attack_type = config.get("attack_type", "sniper")
     threads = config.get("threads", 5)
 
-    # Compte des positions §0§, §1§...
     all_text = url + body + json.dumps(headers)
     positions = len(re.findall(r"§\d+§", all_text))
     if positions == 0:
@@ -1733,7 +1753,6 @@ def run_intruder(config):
     elif attack_type == "battering_ram":
         combos = [[p] * positions for p in payloads]
     elif attack_type == "pitchfork":
-        # payloads = liste de listes ou liste simple
         if payloads and isinstance(payloads[0], list):
             combos = [list(c) for c in zip(*payloads)]
         else:
@@ -1830,17 +1849,25 @@ def api_intruder_status():
 # ==================== MAIN ====================
 
 def run_web():
+    ips = get_local_ips()
+    primary = ips[0]
+    extra = " | ".join(ips[1:]) if len(ips) > 1 else "—"
+
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
 ║   🔷 BURP-LIKE WEB v2.2 — JATHNIEL EDITION                   ║
 ║                                                              ║
-║   Interface web :  http://127.0.0.1:{WEB_PORT}                     ║
-║   Proxy MITM    :  http://127.0.0.1:{PROXY_PORT}                     ║
+║   Interface web :                                            ║
+║     → http://127.0.0.1:{WEB_PORT}          (depuis WSL)              ║
+║     → http://{primary}:{WEB_PORT}    (depuis Windows)            ║
 ║                                                              ║
-║   Ouvre ton navigateur sur http://127.0.0.1:{WEB_PORT}             ║
-║   Configure le proxy sur 127.0.0.1:{PROXY_PORT}                    ║
-║   Certificat   : ~/.mitmproxy/mitmproxy-ca-cert.pem          ║
+║   Proxy MITM    :                                            ║
+║     → 127.0.0.1:{PROXY_PORT}             (depuis WSL)              ║
+║     → {primary}:{PROXY_PORT}         (depuis Windows)            ║
+║                                                              ║
+║   Certificat    : ~/.mitmproxy/mitmproxy-ca-cert.pem         ║
+║   Autres IPs    : {extra}                                    ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
