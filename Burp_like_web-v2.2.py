@@ -4,7 +4,7 @@
 BURP-LIKE WEB v2.2 — JATHNIEL EDITION
 Proxy d'interception HTTP/HTTPS + interface web moderne (single-file).
 Templates HTML/CSS/JS 100 % embarqués.
-Support WSL (écoute 0.0.0.0 + affichage IP réelle).
+Support WSL + fix zone d'édition Intercept.
 """
 
 import os
@@ -641,7 +641,6 @@ class ProxyServer(threading.Thread):
                 pass
 
     async def _run_master(self):
-        # 0.0.0.0 = accessible depuis Windows (WSL)
         opts = options.Options(
             listen_host="0.0.0.0",
             listen_port=self.port,
@@ -1026,46 +1025,81 @@ INTERCEPT_CONTENT = """
 <div id="pending-list"></div>
 """
 
+# === FIX : zone d'édition ne se ferme plus ===
 INTERCEPT_JS = """
 <script>
+let openEditKeys = new Set();
+let lastPendingKeys = '';
+
 async function loadPending() {
   const data = await api('/api/pending');
-  $('#pend-count').textContent = data.length + ' en attente';
-  const container = $('#pending-list');
-  if (!data.length) {
-    container.innerHTML = '<div class="empty">Aucune requête en attente</div>';
+  const currentKeys = data.map(p => p.key).sort().join('|');
+
+  // Ne reconstruit le DOM que si la liste a vraiment changé
+  if (currentKeys === lastPendingKeys) {
+    $('#pend-count').textContent = data.length + ' en attente';
     return;
   }
-  container.innerHTML = data.map(p => `
+  lastPendingKeys = currentKeys;
+
+  $('#pend-count').textContent = data.length + ' en attente';
+  const container = $('#pending-list');
+
+  if (!data.length) {
+    container.innerHTML = '<div class="empty">Aucune requête en attente</div>';
+    openEditKeys.clear();
+    return;
+  }
+
+  container.innerHTML = data.map(p => {
+    const isOpen = openEditKeys.has(p.key);
+    const safeBody = (p.body || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return `
     <div class="panel" data-key="${p.key}">
       <div class="toolbar">
         <strong>${badgeMethod(p.method)} ${p.url}</strong>
         <button class="btn btn-success btn-sm" onclick="forward('${p.key}')">Forward</button>
         <button class="btn btn-danger btn-sm" onclick="drop('${p.key}')">Drop</button>
-        <button class="btn btn-sm" onclick="toggleEdit(this)">Modifier</button>
+        <button class="btn btn-sm" onclick="toggleEdit('${p.key}', this)">Modifier</button>
       </div>
-      <div class="edit-zone" style="display:none;margin-top:12px">
+      <div class="edit-zone" style="display:${isOpen ? 'block' : 'none'};margin-top:12px">
         <div class="form-row"><label>Méthode</label><input class="input edit-method" value="${p.method}"></div>
         <div class="form-row"><label>URL</label><input class="input edit-url" value="${p.url}"></div>
         <div class="form-row"><label>Headers</label><textarea class="edit-headers">${JSON.stringify(p.headers,null,2)}</textarea></div>
-        <div class="form-row"><label>Body</label><textarea class="edit-body">${p.body||''}</textarea></div>
+        <div class="form-row"><label>Body</label><textarea class="edit-body">${safeBody}</textarea></div>
         <button class="btn btn-primary btn-sm" onclick="modify('${p.key}', this)">Appliquer & Forward</button>
       </div>
       <pre style="margin-top:8px;max-height:120px">${JSON.stringify(p.headers,null,2).slice(0,500)}</pre>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
-function toggleEdit(btn) {
-  const zone = btn.closest('.panel').querySelector('.edit-zone');
-  zone.style.display = zone.style.display === 'none' ? 'block' : 'none';
+
+function toggleEdit(key, btn) {
+  const panel = btn.closest('.panel');
+  const zone = panel.querySelector('.edit-zone');
+  if (zone.style.display === 'none') {
+    zone.style.display = 'block';
+    openEditKeys.add(key);
+  } else {
+    zone.style.display = 'none';
+    openEditKeys.delete(key);
+  }
 }
+
 async function forward(key) {
+  openEditKeys.delete(key);
   await api('/api/forward', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({key})});
+  lastPendingKeys = '';
   loadPending();
 }
+
 async function drop(key) {
+  openEditKeys.delete(key);
   await api('/api/drop', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({key})});
+  lastPendingKeys = '';
   loadPending();
 }
+
 async function modify(key, btn) {
   const panel = btn.closest('.panel');
   let headers = {};
@@ -1076,9 +1110,12 @@ async function modify(key, btn) {
     headers: headers,
     body: panel.querySelector('.edit-body').value
   };
+  openEditKeys.delete(key);
   await api('/api/modify', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({key, modifications:mods})});
+  lastPendingKeys = '';
   loadPending();
 }
+
 $('#btn-forward-all').onclick = async () => {
   const data = await api('/api/pending');
   for (const p of data) await forward(p.key);
@@ -1087,6 +1124,7 @@ $('#btn-drop-all').onclick = async () => {
   const data = await api('/api/pending');
   for (const p of data) await drop(p.key);
 };
+
 loadPending();
 setInterval(loadPending, 1500);
 </script>
@@ -1455,9 +1493,6 @@ def api_request_detail(req_id):
     if not row:
         return jsonify({"error": "not found"}), 404
 
-    # 0id 1method 2url 3host 4path 5headers 6body 7status
-    # 8resp_headers 9resp_body 10timestamp 11modified 12resp_size
-    # 13ct_req 14ct_resp 15decoded_body
     try:
         headers = json.loads(row[5] or "{}")
     except Exception:
